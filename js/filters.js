@@ -1,961 +1,223 @@
 /**
  * IRONFILTER PRO — filters.js
- * 40+ professional filters organized by category.
- * Each filter is a pure function: (ImageData) => ImageData
- * LUT-based processing for maximum performance.
+ * 40+ professional filters. All support selective zone masks.
+ * Organized by category: fitness, studio, cinema, bw.
  */
 
-import { clamp, buildLUT, applyLUTChannels, applyLUTAll, rgbToHsl, hslToRgb, copyPixels, makeImageData } from './utils.js';
+import { clamp } from './utils.js';
 
-/* ================================================================
-   CORE LUT ENGINE
-================================================================ */
+/* ── Tiny LUT builder ── */
+function lut(fn) {
+  const t = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i++) t[i] = clamp(Math.round(fn(i)));
+  return t;
+}
 
-/**
- * Base LUT processor: brightness, contrast, saturation, tint, channel shifts.
- * @param {ImageData} input
- * @param {object}    opts
- * @returns {ImageData}
- */
-function applyBaseLUT(input, opts = {}) {
+/* ── Apply LUT to all 3 channels ── */
+function applyLUT3(data, r, g, b, mask) {
+  for (let i = 0; i < data.length; i += 4) {
+    if (mask && !mask[i >> 2]) continue;
+    data[i]   = r[data[i]];
+    data[i+1] = g[data[i+1]];
+    data[i+2] = b[data[i+2]];
+  }
+}
+
+/* ── Base pixel processor ── */
+function processPixels(imageData, fn, mask) {
+  const d   = new Uint8ClampedArray(imageData.data);
+  const len = d.length;
+  for (let i = 0; i < len; i += 4) {
+    if (mask && !mask[i >> 2]) continue;
+    const r = d[i], g = d[i+1], b = d[i+2];
+    const [nr, ng, nb] = fn(r, g, b);
+    d[i] = clamp(nr); d[i+1] = clamp(ng); d[i+2] = clamp(nb);
+  }
+  return new ImageData(d, imageData.width, imageData.height);
+}
+
+/* ── LUT-based fast filter ── */
+function lutFilter(imageData, opts, mask) {
   const {
-    brightness   = 0,    // [-100..100]
-    contrast     = 0,    // [-100..100]
-    saturation   = 0,    // [-100..100]
-    tintR        = 0,    // red channel bias  [-30..30]
-    tintG        = 0,    // green channel bias
-    tintB        = 0,    // blue channel bias
-    tintColor    = null, // [r,g,b] color tint
-    tintAmount   = 0,    // [0..1] blend with tintColor
-    shadowR      = 1, shadowG = 1, shadowB = 1, // shadow channel multipliers
-    highlightR   = 1, highlightG = 1, highlightB = 1, // highlight channel multipliers
-    gammaR       = 1, gammaG = 1, gammaB = 1,         // gamma per channel
-    invert       = false,
-    sepia        = 0,    // [0..1]
-    blackWhite   = false,
+    brightness = 0, contrast = 0, saturation = 0,
+    tintR = 0, tintG = 0, tintB = 0,
+    tintColor = null, tintAmt = 0,
+    shadowR = 1, shadowG = 1, shadowB = 1,
+    highlightR = 1, highlightG = 1, highlightB = 1,
+    gammaR = 1, gammaG = 1, gammaB = 1,
+    sepia = 0, bw = false,
   } = opts;
 
   const b  = brightness / 100;
   const c  = contrast   / 100;
   const s  = saturation / 100;
 
-  // Build per-channel LUTs
-  const rTable = buildLUT(i => {
-    let v = i;
-    // Gamma
-    v = Math.pow(v / 255, 1 / gammaR) * 255;
-    // Brightness
+  const buildCh = (tint, shad, high, gam) => lut(i => {
+    let v = Math.pow(i / 255, 1 / gam) * 255;
     v += b * 255;
-    // Contrast
     v = (v - 128) * (1 + c) + 128;
-    // Channel tint
-    v += tintR;
-    // Shadow/Highlight per channel
+    v += tint;
     const lum = i / 255;
-    if (lum < 0.5) v *= shadowR;
-    else            v = 255 - (255 - v) * (2 - highlightR);
-    // Invert
-    if (invert) v = 255 - v;
+    v = lum < 0.5 ? v * shad : 255 - (255 - v) * (2 - high);
     return v;
   });
 
-  const gTable = buildLUT(i => {
-    let v = i;
-    v = Math.pow(v / 255, 1 / gammaG) * 255;
-    v += b * 255;
-    v = (v - 128) * (1 + c) + 128;
-    v += tintG;
-    const lum = i / 255;
-    if (lum < 0.5) v *= shadowG;
-    else            v = 255 - (255 - v) * (2 - highlightG);
-    if (invert) v = 255 - v;
-    return v;
-  });
+  const rT = buildCh(tintR, shadowR, highlightR, gammaR);
+  const gT = buildCh(tintG, shadowG, highlightG, gammaG);
+  const bT = buildCh(tintB, shadowB, highlightB, gammaB);
 
-  const bTable = buildLUT(i => {
-    let v = i;
-    v = Math.pow(v / 255, 1 / gammaB) * 255;
-    v += b * 255;
-    v = (v - 128) * (1 + c) + 128;
-    v += tintB;
-    const lum = i / 255;
-    if (lum < 0.5) v *= shadowB;
-    else            v = 255 - (255 - v) * (2 - highlightB);
-    if (invert) v = 255 - v;
-    return v;
-  });
+  return processPixels(imageData, (r, g, bl) => {
+    let nr = rT[r], ng = gT[g], nb = bT[bl];
 
-  // Apply LUTs and per-pixel saturation/tint/sepia
-  const src = input.data;
-  const out = new Uint8ClampedArray(src.length);
-  const len = src.length;
-
-  for (let i = 0; i < len; i += 4) {
-    let r = rTable[src[i]];
-    let g = gTable[src[i + 1]];
-    let bl= bTable[src[i + 2]];
-
-    // Saturation
     if (s !== 0) {
-      const gray = 0.299 * r + 0.587 * g + 0.114 * bl;
-      r  = clamp(gray + (r  - gray) * (1 + s));
-      g  = clamp(gray + (g  - gray) * (1 + s));
-      bl = clamp(gray + (bl - gray) * (1 + s));
+      const gray = 0.299*nr + 0.587*ng + 0.114*nb;
+      nr = gray + (nr - gray) * (1+s);
+      ng = gray + (ng - gray) * (1+s);
+      nb = gray + (nb - gray) * (1+s);
     }
 
-    // Sepia
+    if (bw) {
+      const bwv = 0.299*clamp(nr)+0.587*clamp(ng)+0.114*clamp(nb);
+      nr = ng = nb = bwv;
+    }
+
     if (sepia > 0) {
-      const sr = clamp(r * 0.393 + g * 0.769 + bl * 0.189);
-      const sg = clamp(r * 0.349 + g * 0.686 + bl * 0.168);
-      const sb = clamp(r * 0.272 + g * 0.534 + bl * 0.131);
-      r  = clamp(r  * (1 - sepia) + sr * sepia);
-      g  = clamp(g  * (1 - sepia) + sg * sepia);
-      bl = clamp(bl * (1 - sepia) + sb * sepia);
+      const sr = clamp(nr*0.393+ng*0.769+nb*0.189);
+      const sg = clamp(nr*0.349+ng*0.686+nb*0.168);
+      const sb = clamp(nr*0.272+ng*0.534+nb*0.131);
+      nr = nr*(1-sepia)+sr*sepia;
+      ng = ng*(1-sepia)+sg*sepia;
+      nb = nb*(1-sepia)+sb*sepia;
     }
 
-    // Black & White
-    if (blackWhite) {
-      const bwVal = clamp(0.299 * r + 0.587 * g + 0.114 * bl);
-      r = g = bl = bwVal;
+    if (tintColor && tintAmt > 0) {
+      nr = clamp(nr)*(1-tintAmt) + tintColor[0]*tintAmt;
+      ng = clamp(ng)*(1-tintAmt) + tintColor[1]*tintAmt;
+      nb = clamp(nb)*(1-tintAmt) + tintColor[2]*tintAmt;
     }
 
-    // Color tint blend
-    if (tintColor && tintAmount > 0) {
-      r  = clamp(r  * (1 - tintAmount) + tintColor[0] * tintAmount);
-      g  = clamp(g  * (1 - tintAmount) + tintColor[1] * tintAmount);
-      bl = clamp(bl * (1 - tintAmount) + tintColor[2] * tintAmount);
-    }
-
-    out[i]     = r;
-    out[i + 1] = g;
-    out[i + 2] = bl;
-    out[i + 3] = src[i + 3];
-  }
-
-  return makeImageData(out, input.width, input.height);
+    return [nr, ng, nb];
+  }, mask);
 }
 
-/**
- * Blend two ImageDatas at a given opacity.
- * @param {ImageData} base
- * @param {ImageData} overlay
- * @param {number}    amount - [0..1]
- * @returns {ImageData}
- */
-function blendImageData(base, overlay, amount) {
-  if (amount >= 1) return overlay;
-  if (amount <= 0) return base;
+/* ══════════════════════════════════════════
+   FILTER CATALOGUE
+══════════════════════════════════════════ */
 
-  const src = base.data;
-  const ovr = overlay.data;
-  const out = new Uint8ClampedArray(src.length);
-  const t   = amount;
-  const u   = 1 - t;
+const CATALOGUE = [
+  /* ─── ALL ─── */
+  { id:'original',   name:'Original',     cat:'all',     apply:(d,i,m)=>d },
 
-  for (let i = 0; i < src.length; i += 4) {
-    out[i]     = clamp(src[i]     * u + ovr[i]     * t);
-    out[i + 1] = clamp(src[i + 1] * u + ovr[i + 1] * t);
-    out[i + 2] = clamp(src[i + 2] * u + ovr[i + 2] * t);
-    out[i + 3] = src[i + 3];
-  }
+  /* ─── FITNESS ─── */
+  { id:'iron',       name:'Iron',         cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:8,contrast:45,saturation:-20,tintR:12,tintG:4,tintColor:[255,190,140],tintAmt:0.07,shadowG:0.92,shadowB:0.88,highlightR:1.06},m) },
+  { id:'beast',      name:'Beast Mode',   cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:-8,contrast:65,saturation:15,tintR:18,tintG:4,tintB:-8,tintColor:[255,90,0],tintAmt:0.09,shadowR:0.85,shadowG:0.80,shadowB:0.75,highlightR:1.1},m) },
+  { id:'champion',   name:'Champion',     cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:15,contrast:38,saturation:10,tintColor:[245,196,0],tintAmt:0.16,tintR:8,tintG:4,highlightR:1.08},m) },
+  { id:'sweat',      name:'Sweat',        cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:20,contrast:28,saturation:-12,tintColor:[255,215,100],tintAmt:0.14,highlightR:1.04,highlightG:1.02},m) },
+  { id:'powerlifting',name:'Powerlifting',cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:-12,contrast:70,saturation:-35,tintColor:[50,30,10],tintAmt:0.08,shadowR:0.80,shadowG:0.78,shadowB:0.72,gammaR:0.9,gammaG:0.92,gammaB:0.95},m) },
+  { id:'crossfit',   name:'CrossFit',     cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:5,contrast:55,saturation:25,tintColor:[0,220,200],tintAmt:0.08,tintR:-5,tintB:8},m) },
+  { id:'bodybuilding',name:'Bodybuilding',cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:12,contrast:50,saturation:-15,tintColor:[255,180,100],tintAmt:0.1,highlightR:1.1,highlightG:1.05,shadowB:0.85},m) },
+  { id:'golden',     name:'Golden Hour',  cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:18,contrast:25,saturation:15,tintColor:[255,200,80],tintAmt:0.18,tintR:15,tintG:8,tintB:-10,highlightR:1.06},m) },
+  { id:'gymraw',     name:'Gym Raw',      cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:60,saturation:-50,tintColor:[80,70,60],tintAmt:0.1,shadowR:0.88,shadowG:0.86,shadowB:0.80},m) },
+  { id:'shred',      name:'Shred',        cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:-10,contrast:75,saturation:-25,tintColor:[30,20,10],tintAmt:0.06,shadowR:0.70,shadowG:0.68,shadowB:0.65,highlightR:1.15},m) },
+  { id:'bulk',       name:'Bulk Season',  cat:'fitness', apply:(d,i,m)=>lutFilter(d,{brightness:10,contrast:30,saturation:20,tintColor:[255,160,80],tintAmt:0.12,highlightR:1.06},m) },
 
-  return makeImageData(out, base.width, base.height);
-}
+  /* ─── STUDIO ─── */
+  { id:'studio-clean',name:'Studio Clean',cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:15,contrast:20,saturation:-8,tintColor:[240,240,255],tintAmt:0.06,highlightR:1.04,highlightG:1.04,highlightB:1.06},m) },
+  { id:'studio-dark', name:'Studio Dark', cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:-15,contrast:55,saturation:-20,tintColor:[20,20,30],tintAmt:0.08,shadowR:0.75,shadowG:0.75,shadowB:0.80},m) },
+  { id:'magazine',   name:'Magazine',     cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:20,contrast:25,saturation:-15,tintColor:[255,245,235],tintAmt:0.1,highlightR:1.05,highlightG:1.04,highlightB:1.02},m) },
+  { id:'editorial',  name:'Editorial',    cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:8,contrast:35,saturation:-30,tintColor:[220,215,210],tintAmt:0.08,highlightR:1.06},m) },
+  { id:'highkey',    name:'High Key',     cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:35,contrast:10,saturation:-20,highlightR:1.08,highlightG:1.08,highlightB:1.1},m) },
+  { id:'lowkey',     name:'Low Key',      cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:-20,contrast:60,saturation:-30,shadowR:0.65,shadowG:0.65,shadowB:0.65,highlightR:1.1},m) },
+  { id:'skin-glow',  name:'Skin Glow',    cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:18,contrast:15,saturation:8,tintColor:[255,220,180],tintAmt:0.12,highlightR:1.06,highlightG:1.04},m) },
+  { id:'dramatic',   name:'Dramatic',     cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:70,saturation:-10,shadowR:0.72,shadowG:0.72,shadowB:0.72,highlightR:1.12},m) },
+  { id:'warm-studio',name:'Warm Studio',  cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:12,contrast:22,saturation:8,tintColor:[255,210,160],tintAmt:0.1,tintR:12,tintB:-8},m) },
+  { id:'cool-studio',name:'Cool Studio',  cat:'studio', apply:(d,i,m)=>lutFilter(d,{brightness:8,contrast:20,saturation:-5,tintColor:[180,200,255],tintAmt:0.1,tintR:-10,tintB:15},m) },
+  { id:'teal-orange',name:'Teal & Orange',cat:'studio', apply:(d,i,m)=>processPixels(d,(r,g,b)=>{
+    const lum=(r+g+b)/3/255;
+    const warm=Math.max(0,lum-0.5)*2;
+    const cool=Math.max(0,0.4-lum)*2;
+    let nr=clamp(r+warm*30-cool*15);
+    let ng=clamp(g+warm*10-cool*5);
+    let nb=clamp(b-warm*20+cool*20);
+    nr=clamp((nr-128)*1.35+128);ng=clamp((ng-128)*1.30+128);nb=clamp((nb-128)*1.30+128);
+    return[nr,ng,nb];
+  },m) },
 
-/* ================================================================
-   FILTER DEFINITIONS — 40+ Filters
-================================================================ */
+  /* ─── CINEMA ─── */
+  { id:'cinema',     name:'Cinema',       cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:42,saturation:-22,tintColor:[60,50,80],tintAmt:0.1,shadowB:1.15,shadowG:0.95,highlightR:1.05,highlightG:0.98,gammaR:0.95},m) },
+  { id:'moody',      name:'Moody',        cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-12,contrast:38,saturation:-28,tintColor:[100,80,140],tintAmt:0.12,shadowB:1.12,shadowG:0.92},m) },
+  { id:'epic',       name:'Epic',         cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:0,contrast:60,saturation:10,tintColor:[255,150,0],tintAmt:0.08,shadowB:1.1,highlightR:1.08,gammaR:0.92},m) },
+  { id:'midnight',   name:'Midnight',     cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-22,contrast:52,saturation:-30,tintColor:[0,50,180],tintAmt:0.14,shadowR:0.75,shadowG:0.75,shadowB:0.90,gammaB:1.12},m) },
+  { id:'analog',     name:'Analog',       cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:5,contrast:20,saturation:-15,tintColor:[255,230,180],tintAmt:0.1,shadowR:0.95,shadowG:0.90,shadowB:0.82,highlightR:1.05,gammaB:1.08},m) },
+  { id:'kodak',      name:'Kodak',        cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:12,contrast:22,saturation:5,tintColor:[255,235,190],tintAmt:0.08,shadowR:0.95,shadowG:0.88,shadowB:0.80,highlightR:1.04},m) },
+  { id:'neon',       name:'Neon Nights',  cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-10,contrast:50,saturation:55,tintColor:[0,255,200],tintAmt:0.06,shadowB:1.15},m) },
+  { id:'danger',     name:'Danger',       cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:58,saturation:-15,tintColor:[200,0,0],tintAmt:0.14,shadowR:1.1,shadowG:0.72,shadowB:0.72},m) },
+  { id:'urban',      name:'Urban',        cat:'cinema', apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:42,saturation:-18,tintColor:[70,90,110],tintAmt:0.1,shadowB:1.08},m) },
 
-/** @type {FilterDefinition[]} */
-export const FILTERS = [
-
-  /* ── NONE / RAW ── */
-  {
-    id: 'raw',
-    name: 'Original',
-    category: 'all',
-    apply: (img) => img,
-  },
-
-  /* ════════════════════════════════════════
-     FITNESS CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'iron',
-    name: 'Iron',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 8,
-      contrast:   45,
-      saturation: -20,
-      tintR:      12, tintG: 4,
-      tintColor:  [255, 190, 140],
-      tintAmount: 0.07,
-      shadowG:    0.92, shadowB: 0.88,
-      highlightR: 1.06,
-    }),
-  },
-
-  {
-    id: 'beast',
-    name: 'Beast Mode',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -8,
-      contrast:   65,
-      saturation: 18,
-      tintR:      18, tintG: 4, tintB: -8,
-      tintColor:  [255, 90, 0],
-      tintAmount: 0.09,
-      shadowR:    0.85, shadowG: 0.80, shadowB: 0.75,
-      highlightR: 1.1,
-    }),
-  },
-
-  {
-    id: 'sweat',
-    name: 'Sweat',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 20,
-      contrast:   28,
-      saturation: -12,
-      tintColor:  [255, 215, 100],
-      tintAmount: 0.14,
-      highlightR: 1.04, highlightG: 1.02,
-    }),
-  },
-
-  {
-    id: 'champion',
-    name: 'Champion',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 15,
-      contrast:   38,
-      saturation: 10,
-      tintColor:  [245, 196, 0],
-      tintAmount: 0.16,
-      tintR:      8, tintG: 4,
-      highlightR: 1.08,
-    }),
-  },
-
-  {
-    id: 'powerlifting',
-    name: 'Powerlifting',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -12,
-      contrast:   70,
-      saturation: -35,
-      tintColor:  [50, 30, 10],
-      tintAmount: 0.08,
-      shadowR:    0.80, shadowG: 0.78, shadowB: 0.72,
-      gammaR:     0.9, gammaG: 0.92, gammaB: 0.95,
-    }),
-  },
-
-  {
-    id: 'crossfit',
-    name: 'CrossFit',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 5,
-      contrast:   55,
-      saturation: 25,
-      tintColor:  [0, 220, 200],
-      tintAmount: 0.08,
-      tintR:      -5, tintB: 8,
-    }),
-  },
-
-  {
-    id: 'gym-raw',
-    name: 'Gym Raw',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   60,
-      saturation: -50,
-      tintColor:  [80, 70, 60],
-      tintAmount: 0.1,
-      shadowR:    0.88, shadowG: 0.86, shadowB: 0.80,
-    }),
-  },
-
-  {
-    id: 'bodybuilding',
-    name: 'Bodybuilding',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 12,
-      contrast:   50,
-      saturation: -15,
-      tintColor:  [255, 180, 100],
-      tintAmount: 0.1,
-      highlightR: 1.1, highlightG: 1.05,
-      shadowB:    0.85,
-    }),
-  },
-
-  {
-    id: 'golden-hour',
-    name: 'Golden Hour',
-    category: 'fitness',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 18,
-      contrast:   25,
-      saturation: 15,
-      tintColor:  [255, 200, 80],
-      tintAmount: 0.18,
-      tintR:      15, tintG: 8, tintB: -10,
-      highlightR: 1.06,
-    }),
-  },
-
-  /* ════════════════════════════════════════
-     DARK CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'midnight',
-    name: 'Midnight',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -22,
-      contrast:   52,
-      saturation: -30,
-      tintColor:  [0, 50, 180],
-      tintAmount: 0.14,
-      shadowR:    0.75, shadowG: 0.75, shadowB: 0.90,
-      gammaB:     1.12,
-    }),
-  },
-
-  {
-    id: 'noir',
-    name: 'Noir',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -10,
-      contrast:   60,
-      blackWhite: true,
-      shadowR:    0.78, shadowG: 0.78, shadowB: 0.78,
-      highlightR: 1.08,
-    }),
-  },
-
-  {
-    id: 'danger',
-    name: 'Danger',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   58,
-      saturation: -15,
-      tintColor:  [200, 0, 0],
-      tintAmount: 0.14,
-      shadowR:    1.1, shadowG: 0.72, shadowB: 0.72,
-    }),
-  },
-
-  {
-    id: 'shadow',
-    name: 'Shadow',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -25,
-      contrast:   45,
-      saturation: -40,
-      tintColor:  [20, 20, 30],
-      tintAmount: 0.06,
-      gammaR:     0.85, gammaG: 0.88, gammaB: 0.92,
-    }),
-  },
-
-  {
-    id: 'abyss',
-    name: 'Abyss',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -30,
-      contrast:   55,
-      saturation: -60,
-      tintColor:  [0, 0, 40],
-      tintAmount: 0.1,
-      shadowR:    0.60, shadowG: 0.62, shadowB: 0.70,
-    }),
-  },
-
-  {
-    id: 'carbon',
-    name: 'Carbon',
-    category: 'dark',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -8,
-      contrast:   65,
-      saturation: -80,
-      tintColor:  [30, 30, 40],
-      tintAmount: 0.08,
-      gammaR:     0.9, gammaG: 0.92, gammaB: 0.95,
-    }),
-  },
-
-  /* ════════════════════════════════════════
-     CINEMA CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'cinema',
-    name: 'Cinema',
-    category: 'cinema',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   42,
-      saturation: -22,
-      tintColor:  [60, 50, 80],
-      tintAmount: 0.1,
-      shadowB:    1.15, shadowG: 0.95,
-      highlightR: 1.05, highlightG: 0.98,
-      gammaR:     0.95, gammaG: 0.96,
-    }),
-  },
-
-  {
-    id: 'teal-orange',
-    name: 'Teal & Orange',
-    category: 'cinema',
-    apply: (img) => {
-      const src   = img.data;
-      const out   = new Uint8ClampedArray(src.length);
-      for (let i = 0; i < src.length; i += 4) {
-        let r = src[i], g = src[i + 1], b = src[i + 2];
-        const lum = (r + g + b) / 3 / 255;
-        // Shadows → teal
-        const tealStrength = Math.max(0, 0.4 - lum) * 2;
-        // Highlights → orange
-        const warmStrength = Math.max(0, lum - 0.5) * 2;
-        r = clamp(r + warmStrength * 30  - tealStrength * 15);
-        g = clamp(g + warmStrength * 10  - tealStrength * 5);
-        b = clamp(b - warmStrength * 20  + tealStrength * 20);
-        // Contrast
-        r = clamp((r - 128) * 1.35 + 128);
-        g = clamp((g - 128) * 1.30 + 128);
-        b = clamp((b - 128) * 1.30 + 128);
-        out[i] = r; out[i+1] = g; out[i+2] = b; out[i+3] = src[i+3];
-      }
-      return makeImageData(out, img.width, img.height);
-    },
-  },
-
-  {
-    id: 'moody',
-    name: 'Moody',
-    category: 'cinema',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -12,
-      contrast:   38,
-      saturation: -28,
-      tintColor:  [100, 80, 140],
-      tintAmount: 0.12,
-      shadowB:    1.12, shadowG: 0.92,
-    }),
-  },
-
-  {
-    id: 'analog',
-    name: 'Analog',
-    category: 'cinema',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 5,
-      contrast:   20,
-      saturation: -15,
-      tintColor:  [255, 230, 180],
-      tintAmount: 0.1,
-      shadowR:    0.95, shadowG: 0.90, shadowB: 0.82,
-      highlightR: 1.05, highlightG: 1.02,
-      gammaB:     1.08,
-    }),
-  },
-
-  {
-    id: 'epic',
-    name: 'Epic',
-    category: 'cinema',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 0,
-      contrast:   60,
-      saturation: 10,
-      tintColor:  [255, 150, 0],
-      tintAmount: 0.08,
-      shadowB:    1.1,
-      highlightR: 1.08,
-      gammaR:     0.92,
-    }),
-  },
-
-  /* ════════════════════════════════════════
-     VINTAGE CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'vintage',
-    name: 'Vintage',
-    category: 'vintage',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 8,
-      contrast:   18,
-      saturation: -20,
-      sepia:      0.3,
-      tintColor:  [255, 240, 200],
-      tintAmount: 0.1,
-      gammaR:     0.95, gammaG: 0.97, gammaB: 1.05,
-    }),
-  },
-
-  {
-    id: 'kodak',
-    name: 'Kodak',
-    category: 'vintage',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 12,
-      contrast:   22,
-      saturation: 5,
-      tintColor:  [255, 235, 190],
-      tintAmount: 0.08,
-      shadowR:    0.95, shadowG: 0.88, shadowB: 0.80,
-      highlightR: 1.04, highlightG: 1.02,
-    }),
-  },
-
-  {
-    id: 'faded',
-    name: 'Faded',
-    category: 'vintage',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 18,
-      contrast:   -15,
-      saturation: -35,
-      tintColor:  [220, 210, 195],
-      tintAmount: 0.12,
-      shadowR:    1.1, shadowG: 1.05, shadowB: 0.95,
-    }),
-  },
-
-  {
-    id: 'lomo',
-    name: 'Lomo',
-    category: 'vintage',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   50,
-      saturation: 20,
-      tintColor:  [255, 200, 100],
-      tintAmount: 0.08,
-      shadowR:    1.1, shadowB: 0.8,
-    }),
-  },
-
-  {
-    id: 'polaroid',
-    name: 'Polaroid',
-    category: 'vintage',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 15,
-      contrast:   10,
-      saturation: -8,
-      sepia:      0.15,
-      tintColor:  [255, 245, 220],
-      tintAmount: 0.1,
-      highlightR: 1.06, highlightG: 1.04, highlightB: 0.96,
-    }),
-  },
-
-  /* ════════════════════════════════════════
-     BLACK & WHITE CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'monolith',
-    name: 'Monolith',
-    category: 'bw',
-    apply: (img) => applyBaseLUT(img, {
-      contrast:   55,
-      blackWhite: true,
-      shadowR:    0.75,
-      highlightR: 1.08,
-    }),
-  },
-
-  {
-    id: 'silver',
-    name: 'Silver',
-    category: 'bw',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 8,
-      contrast:   30,
-      blackWhite: true,
-      tintColor:  [200, 210, 220],
-      tintAmount: 0.08,
-    }),
-  },
-
-  {
-    id: 'dramatic-bw',
-    name: 'Dramatic',
-    category: 'bw',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -8,
-      contrast:   75,
-      blackWhite: true,
-      shadowR:    0.65,
-      highlightR: 1.12,
-      gammaR:     0.88,
-    }),
-  },
-
-  {
-    id: 'agfa',
-    name: 'Agfa',
-    category: 'bw',
-    apply: (img) => applyBaseLUT(img, {
-      contrast:   40,
-      blackWhite: true,
-      tintColor:  [180, 175, 165],
-      tintAmount: 0.1,
-      sepia:      0.12,
-    }),
-  },
-
-  {
-    id: 'infrared',
-    name: 'Infrared',
-    category: 'bw',
-    apply: (img) => {
-      const src = img.data;
-      const out = new Uint8ClampedArray(src.length);
-      for (let i = 0; i < src.length; i += 4) {
-        const r = src[i], g = src[i + 1], b = src[i + 2];
-        // Infrared: swap green luminance emphasis, blow out highlights
-        const ir = clamp(r * 0.2 + g * 0.9 + b * 0.1);
-        const v  = clamp((ir - 128) * 1.6 + 180);
-        out[i] = out[i+1] = out[i+2] = v;
-        out[i+3] = src[i+3];
-      }
-      return makeImageData(out, img.width, img.height);
-    },
-  },
-
-  /* ════════════════════════════════════════
-     HDR CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'hdr',
-    name: 'HDR',
-    category: 'hdr',
-    apply: (img) => {
-      // HDR: local tone-mapping simulation via clarity boost
-      const base = applyBaseLUT(img, {
-        brightness: 5,
-        contrast:   50,
-        saturation: 20,
-      });
-      return base;
-    },
-  },
-
-  {
-    id: 'clarity-boost',
-    name: 'Clarity+',
-    category: 'hdr',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 0,
-      contrast:   45,
-      saturation: 15,
-      shadowR:    0.90, shadowG: 0.90, shadowB: 0.88,
-      highlightR: 1.06, highlightG: 1.05, highlightB: 1.04,
-    }),
-  },
-
-  {
-    id: 'vivid',
-    name: 'Vivid',
-    category: 'hdr',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 8,
-      contrast:   40,
-      saturation: 45,
-      highlightR: 1.05, highlightG: 1.04, highlightB: 1.05,
-    }),
-  },
-
-  /* ════════════════════════════════════════
-     COLOR CATEGORY
-  ════════════════════════════════════════ */
-
-  {
-    id: 'warm',
-    name: 'Warm',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 8,
-      contrast:   18,
-      saturation: 10,
-      tintR:      20, tintG: 8, tintB: -15,
-      tintColor:  [255, 210, 140],
-      tintAmount: 0.1,
-    }),
-  },
-
-  {
-    id: 'cold',
-    name: 'Cold',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 0,
-      contrast:   20,
-      saturation: -5,
-      tintR:      -15, tintB: 20,
-      tintColor:  [140, 180, 255],
-      tintAmount: 0.1,
-    }),
-  },
-
-  {
-    id: 'natural',
-    name: 'Natural',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 5,
-      contrast:   12,
-      saturation: 8,
-      tintColor:  [240, 255, 240],
-      tintAmount: 0.04,
-    }),
-  },
-
-  {
-    id: 'pop',
-    name: 'Pop',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 10,
-      contrast:   35,
-      saturation: 40,
-      highlightR: 1.04, highlightG: 1.04, highlightB: 1.05,
-    }),
-  },
-
-  {
-    id: 'fade',
-    name: 'Fade',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 20,
-      contrast:   -20,
-      saturation: -25,
-      shadowR:    1.15, shadowG: 1.1, shadowB: 1.05,
-    }),
-  },
-
-  {
-    id: 'urban',
-    name: 'Urban',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   42,
-      saturation: -18,
-      tintColor:  [70, 90, 110],
-      tintAmount: 0.1,
-      shadowB:    1.08,
-    }),
-  },
-
-  {
-    id: 'street',
-    name: 'Street',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -8,
-      contrast:   55,
-      saturation: -30,
-      tintColor:  [80, 80, 80],
-      tintAmount: 0.06,
-      gammaR:     0.92, gammaG: 0.94,
-    }),
-  },
-
-  {
-    id: 'soft',
-    name: 'Soft',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 15,
-      contrast:   -8,
-      saturation: 8,
-      tintColor:  [255, 240, 240],
-      tintAmount: 0.08,
-      highlightR: 1.03, highlightG: 1.02,
-    }),
-  },
-
-  {
-    id: 'hard',
-    name: 'Hard',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -8,
-      contrast:   68,
-      saturation: -10,
-      shadowR:    0.80, shadowG: 0.78, shadowB: 0.75,
-      highlightR: 1.1,
-    }),
-  },
-
-  {
-    id: 'tokyo',
-    name: 'Tokyo',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: 5,
-      contrast:   30,
-      saturation: 20,
-      tintColor:  [255, 50, 100],
-      tintAmount: 0.07,
-      shadowB:    1.1,
-    }),
-  },
-
-  {
-    id: 'concrete',
-    name: 'Concrete',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -5,
-      contrast:   35,
-      saturation: -55,
-      tintColor:  [100, 115, 130],
-      tintAmount: 0.1,
-    }),
-  },
-
-  {
-    id: 'neon',
-    name: 'Neon',
-    category: 'color',
-    apply: (img) => applyBaseLUT(img, {
-      brightness: -10,
-      contrast:   50,
-      saturation: 55,
-      tintColor:  [0, 255, 200],
-      tintAmount: 0.06,
-      shadowB:    1.15,
-    }),
-  },
-
+  /* ─── B&W ─── */
+  { id:'bw-classic', name:'Classic B&W',  cat:'bw',     apply:(d,i,m)=>lutFilter(d,{contrast:50,bw:true,shadowR:0.75,highlightR:1.08},m) },
+  { id:'bw-silver',  name:'Silver',       cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:8,contrast:30,bw:true,tintColor:[200,210,220],tintAmt:0.08},m) },
+  { id:'bw-dramatic',name:'Dramatic',     cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:-8,contrast:75,bw:true,shadowR:0.65,highlightR:1.12,gammaR:0.88},m) },
+  { id:'bw-studio',  name:'Studio BW',    cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:5,contrast:55,bw:true,highlightR:1.06,shadowR:0.80},m) },
+  { id:'bw-film',    name:'Film Noir',    cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:-5,contrast:65,bw:true,sepia:0.15,shadowR:0.70,highlightR:1.1},m) },
+  { id:'bw-high',    name:'High Key BW',  cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:25,contrast:20,bw:true,highlightR:1.1},m) },
+  { id:'bw-low',     name:'Low Key BW',   cat:'bw',     apply:(d,i,m)=>lutFilter(d,{brightness:-15,contrast:70,bw:true,shadowR:0.60,highlightR:1.15},m) },
+  { id:'infrared',   name:'Infrared',     cat:'bw',     apply:(d,i,m)=>processPixels(d,(r,g,b)=>{
+    const ir=clamp(r*0.2+g*0.9+b*0.1);
+    const v=clamp((ir-128)*1.6+180);
+    return[v,v,v];
+  },m) },
 ];
 
-/* ================================================================
-   FILTER REGISTRY
-================================================================ */
-
-/** Fast lookup map by filter ID. */
-const FILTER_MAP = new Map(FILTERS.map(f => [f.id, f]));
-
-/**
- * Get a filter definition by ID.
- * @param {string} id
- * @returns {FilterDefinition|null}
- */
-export function getFilter(id) {
-  return FILTER_MAP.get(id) || null;
-}
-
-/**
- * Get all filters for a given category.
- * @param {string} category
- * @param {string} [search] - optional name search
- * @returns {FilterDefinition[]}
- */
-export function getFiltersByCategory(category, search = '') {
-  let list = category === 'all'
-    ? FILTERS
-    : FILTERS.filter(f => f.category === category || f.id === 'raw');
-
-  if (search.trim()) {
-    const q = search.toLowerCase();
-    list = list.filter(f => f.name.toLowerCase().includes(q));
+/* ══════════════════════════════════════════
+   FILTER ENGINE
+══════════════════════════════════════════ */
+export class FilterEngine {
+  constructor() {
+    this._map = new Map(CATALOGUE.map(f => [f.id, f]));
   }
 
-  return list;
-}
+  /**
+   * Get filters for a category.
+   * @param {string} cat
+   * @returns {Array}
+   */
+  getFilters(cat = 'all') {
+    if (cat === 'all') return CATALOGUE;
+    return CATALOGUE.filter(f => f.cat === cat || f.id === 'original');
+  }
 
-/**
- * Apply a filter by ID to ImageData.
- * @param {string}    filterId
- * @param {ImageData} imageData
- * @param {number}    [intensity=1] - blend [0..1] with original
- * @returns {ImageData}
- */
-export function applyFilter(filterId, imageData, intensity = 1) {
-  const filter = getFilter(filterId);
-  if (!filter) return imageData;
+  /**
+   * Apply a filter to ImageData with optional zone mask and intensity blend.
+   * @param {ImageData}      imageData
+   * @param {string}         filterId
+   * @param {number}         intensity - [0..1]
+   * @param {Uint8Array|null} mask
+   * @returns {ImageData}
+   */
+  apply(imageData, filterId, intensity = 1, mask = null) {
+    const filter = this._map.get(filterId);
+    if (!filter || filterId === 'original') return imageData;
 
-  const filtered = filter.apply(imageData);
+    const filtered = filter.apply(imageData, intensity, mask);
 
-  if (intensity >= 1) return filtered;
-  if (intensity <= 0) return imageData;
+    // Blend intensity
+    if (intensity >= 1) return filtered;
+    if (intensity <= 0) return imageData;
 
-  return blendImageData(imageData, filtered, intensity);
-}
+    const src = imageData.data;
+    const flt = filtered.data;
+    const out = new Uint8ClampedArray(src.length);
 
-/* ================================================================
-   THUMBNAIL RENDERER
-================================================================ */
+    for (let i = 0; i < src.length; i += 4) {
+      const px = i >> 2;
+      if (mask && !mask[px]) { out[i]=src[i];out[i+1]=src[i+1];out[i+2]=src[i+2];out[i+3]=src[i+3]; continue; }
+      out[i]   = clamp(src[i]   * (1-intensity) + flt[i]   * intensity);
+      out[i+1] = clamp(src[i+1] * (1-intensity) + flt[i+1] * intensity);
+      out[i+2] = clamp(src[i+2] * (1-intensity) + flt[i+2] * intensity);
+      out[i+3] = src[i+3];
+    }
 
-/**
- * Render all filter thumbnails into their <canvas> elements.
- * Uses createImageBitmap for off-thread acceleration.
- * @param {HTMLImageElement|ImageBitmap} source
- * @param {string} [category='all']
- * @param {string} [search='']
- */
-export async function renderFilterThumbnails(source, category = 'all', search = '') {
-  const filters = getFiltersByCategory(category, search);
-
-  for (const filter of filters) {
-    const canvas = document.getElementById(`fthumb-${filter.id}`);
-    if (!canvas) continue;
-
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const w   = canvas.width;
-    const h   = canvas.height;
-
-    ctx.drawImage(source, 0, 0, w, h);
-
-    if (filter.id === 'raw') continue;
-
-    const imageData = ctx.getImageData(0, 0, w, h);
-    const result    = filter.apply(imageData);
-    ctx.putImageData(result, 0, 0);
+    return new ImageData(out, imageData.width, imageData.height);
   }
 }
-
-/* ================================================================
-   CATEGORY LABELS
-================================================================ */
-
-export const CATEGORIES = [
-  { id: 'all',     label: 'Todos'   },
-  { id: 'fitness', label: 'Fitness' },
-  { id: 'dark',    label: 'Dark'    },
-  { id: 'cinema',  label: 'Cinema'  },
-  { id: 'vintage', label: 'Vintage' },
-  { id: 'bw',      label: 'B&W'     },
-  { id: 'hdr',     label: 'HDR'     },
-  { id: 'color',   label: 'Color'   },
-];
