@@ -193,21 +193,6 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
 .toast.show{opacity:1;transform:translateX(0)}
 .toast.ok{border-left-color:var(--green)}
 .toast.err{border-left-color:var(--red)}
-
-/* API KEY MODAL */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;width:min(420px,90vw);display:flex;flex-direction:column;gap:16px}
-.modal-title{font-family:var(--fd);font-weight:900;font-size:1.2rem;text-transform:uppercase;letter-spacing:.06em}
-.modal-sub{font-size:.78rem;color:var(--g);line-height:1.6}
-.modal-input{width:100%;padding:10px 12px;background:var(--lift);border:1px solid var(--border);border-radius:6px;color:var(--w);font-family:monospace;font-size:.82rem;outline:none}
-.modal-input:focus{border-color:var(--gold)}
-.modal-input::placeholder{color:var(--dim)}
-.modal-row{display:flex;gap:8px}
-.modal-btn{flex:1;padding:11px;background:var(--gold);color:#000;font-family:var(--fd);font-weight:700;font-size:.88rem;letter-spacing:.08em;text-transform:uppercase;border:none;border-radius:6px}
-.modal-btn:hover{background:var(--gold2)}
-.modal-btn.sec{background:transparent;border:1px solid var(--border);color:var(--g);font-family:var(--fi);font-size:.78rem;font-weight:500;letter-spacing:0;text-transform:none}
-.modal-btn.sec:hover{border-color:var(--gold);color:var(--w)}
-.modal-note{font-size:.65rem;color:var(--dim);line-height:1.5;padding:10px;background:rgba(240,180,41,.04);border:1px solid rgba(240,180,41,.1);border-radius:6px}
 </style>
 </head>
 <body>
@@ -237,7 +222,7 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
     <div class="topbar-logo">IRON<span>FILTER</span></div>
     <div class="tb-sep"></div>
     <button class="tb-btn" id="btn-newphoto">📂 Nueva foto</button>
-    <button class="tb-btn" id="api-badge" onclick="showAPIModal()">🔑 Configurar API</button>
+    <button class="tb-btn" onclick="showKeysModal()">🔑 API Keys</button>
     <button class="tb-btn" id="btn-undo" disabled>↩</button>
     <button class="tb-btn" id="btn-redo" disabled>↪</button>
     <div class="tb-sep"></div>
@@ -287,7 +272,7 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.25)}
         <div class="panel on" data-panel="ai">
           <div class="ai-card">
             <div class="ai-card-title">✦ Análisis IA</div>
-            <div class="ai-card-sub" id="ai-sub">Claude Vision analiza tu foto: detecta persona, evalúa iluminación, piel y músculo, y aplica el retoque profesional óptimo.</div>
+            <div class="ai-card-sub" id="ai-sub">Usa Gemini Flash (1500 req/día gratis), Groq o OpenRouter — sin coste. Configura tu API key gratuita con el botón <strong style="color:var(--gold)">🔑 API Keys</strong>.</div>
             <button class="btn-ai" id="btn-analyze" disabled>
               <span id="ai-ico">✦</span><span id="ai-txt">Analizar y retocar con IA</span>
             </button>
@@ -860,22 +845,10 @@ async function runAI(){
     const blob=await off.convertToBlob({type:'image/jpeg',quality:.82});
     const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(blob);});
     setS(1,'done');setS(2,'active');
-    const apiKey=sessionStorage.getItem('ifp_apikey');
-    if(!apiKey){showAPIModal(runAI);return;}
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-calls':'true'},
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,
-        messages:[{role:'user',content:[
-          {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64.split(',')[1]}},
-          {type:'text',text:`Eres el mejor fotógrafo de fitness profesional. Analiza esta imagen. Responde SOLO JSON válido sin markdown:
-{"type":"bodybuilder|fitness_model|athlete|powerlifter|crossfit|portrait|no_person","lighting":"studio|natural|gym|outdoor|dark","score":1to10,"positives":["cosa1","cosa2"],"issues":["problema1","problema2","problema3"],"summary":"1-2 frases en español","adjustments":{"exposure":-100to100,"contrast":-100to100,"shadows":-100to100,"highlights":-100to100,"whites":-100to100,"blacks":-100to100,"temp":-100to100,"tint":-100to100,"sat":-100to100,"vibrance":-100to100,"skinBright":-100to100,"skinWarm":-100to100,"skinSmooth":0to100,"skinSat":-100to100,"muscleCon":0to100,"muscleShadow":0to100,"muscleShine":0to100,"bgDark":0to100,"bgDesat":0to100,"bgBlur":0to100,"sharp":0to100,"clarity":-100to100,"vignette":-100to100},"filter":"iron|beast|champion|sweat|shred|golden|magazine|editorial|highkey|lowkey|skinglow|cinema|moody|midnight|tealorng|bwdramatic|original","filterReason":"razón en 6 palabras"}`}
-        ]}]})
-    });
+    setS(2,'active');
+    const ai=await callAIWithFallback(b64.split(',')[1]);
     setS(2,'done');setS(3,'active');
-    const data=await resp.json();
-    if(data.error)throw new Error(data.error.message);
-    const txt=data.content?.[0]?.text||'{}';
-    let ai;try{ai=JSON.parse(txt.replace(/```[a-z]*|```/g,'').trim());}catch{throw new Error('JSON inválido');}
+    
     setS(3,'done');setS(4,'active');
     if(ai.adjustments)Object.entries(ai.adjustments).forEach(([k,v])=>{if(k in S.p)S.p[k]=+v||0;});
     if(ai.filter)S.filter=ai.filter;
@@ -1044,50 +1017,6 @@ document.addEventListener('keydown',e=>{
 
 buildFilterGrid();
 
-/* API KEY MODAL */
-function showAPIModal(callback){
-  $('api-modal').style.display='flex';
-  const inp=$('api-key-input');
-  inp.value=sessionStorage.getItem('ifp_apikey')||'';
-  inp.focus();
-  $('api-key-save').onclick=()=>{
-    const key=inp.value.trim();
-    if(!key.startsWith('sk-ant-')){toast('API key inválida — debe empezar con sk-ant-','err');return;}
-    sessionStorage.setItem('ifp_apikey',key);
-    $('api-modal').style.display='none';
-    toast('✓ API key guardada para esta sesión','ok');
-    if(callback)callback();
-  };
-  $('api-key-cancel').onclick=()=>$('api-modal').style.display='none';
-  inp.onkeydown=e=>{if(e.key==='Enter')$('api-key-save').click();};
-}
-
-// Show API key config button in topbar if key is set
-function updateApiKeyStatus(){
-  const key=sessionStorage.getItem('ifp_apikey');
-  const badge=document.getElementById('api-badge');
-  if(badge)badge.textContent=key?'🔑 API conectada':'🔑 Configurar API';
-}
-
-updateApiKeyStatus();
 </script>
-
-<!-- API KEY MODAL -->
-<div class="modal-overlay" id="api-modal" style="display:none">
-  <div class="modal">
-    <div class="modal-title">✦ Configurar API Key</div>
-    <div class="modal-sub">Para usar el análisis con IA necesitas una API key de Anthropic. Se guarda solo en esta sesión del navegador y nunca se envía a ningún servidor excepto a api.anthropic.com.</div>
-    <input class="modal-input" id="api-key-input" type="password" placeholder="sk-ant-api03-…" autocomplete="off" spellcheck="false"/>
-    <div class="modal-note">
-      🔑 Obtén tu clave gratuita en <strong style="color:var(--gold)">console.anthropic.com</strong><br>
-      🔒 Solo se usa desde tu navegador, nunca se almacena en servidores<br>
-      ⚡ Los nuevos usuarios tienen $5 de crédito gratuito
-    </div>
-    <div class="modal-row">
-      <button class="modal-btn" id="api-key-save">Guardar y analizar</button>
-      <button class="modal-btn sec" id="api-key-cancel">Cancelar</button>
-    </div>
-  </div>
-</div>
 </body>
 </html>
